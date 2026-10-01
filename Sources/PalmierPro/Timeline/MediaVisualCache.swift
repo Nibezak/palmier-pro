@@ -1,7 +1,6 @@
 import AppKit
 import AVFoundation
 import CryptoKit
-import DSWaveformImage
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -15,10 +14,32 @@ final class MediaVisualCache {
     /// Cap concurrent waveform extractions to avoid starving playback.
     private static let waveformGate = AsyncSemaphore(value: 2)
 
+    // MARK: - Speech masks
+
+    let speech = SpeechMaskStore()
+    /// 32 ms cells, value = global speaker id, -1 = none. Session-scoped, set by identifySpeakers.
+    var speakerMasks: [String: [Int]] = [:]
+
+    nonisolated func speakerMask(for mediaRef: String) -> [Int]? {
+        MainActor.assumeIsolated { speakerMasks[mediaRef] }
+    }
+
+    let beats = BeatStore()
+
+    nonisolated func beatAnalysis(for mediaRef: String) -> BeatAnalysis? {
+        beats.analysis(for: mediaRef)
+    }
+
+    init() {
+        speech.onMaskReady = { [weak self] in self?.timelineView?.needsDisplay = true }
+        beats.onBeatsReady = { [weak self] in self?.timelineView?.needsDisplay = true }
+    }
+
     // MARK: - Video thumbnails (sorted by time)
 
     private var videoThumbnails: [String: [(time: Double, image: CGImage)]] = [:]
     private var videoThumbnailInFlight: Set<String> = []
+    private static let videoThumbnailGate = AsyncSemaphore(value: 2)
 
     // MARK: - Image thumbnails (single still per asset)
 
@@ -29,11 +50,23 @@ final class MediaVisualCache {
     // MARK: - Redraw trigger
 
     weak var timelineView: NSView?
+    var onDeadAirCacheInvalidated: (() -> Void)?
 
     // MARK: - Sync lookups (safe for draw calls)
 
     nonisolated func samples(for mediaRef: String) -> [Float]? {
         MainActor.assumeIsolated { waveformSamples[mediaRef] }
+    }
+
+    nonisolated func deadAirMask(
+        for mediaRef: String,
+        settings: SilenceRemovalSettings
+    ) -> [Bool]? {
+        speech.deadAirMask(for: mediaRef, samples: samples(for: mediaRef), settings: settings)
+    }
+
+    nonisolated func quietNonSpeechMask(for mediaRef: String) -> [Bool]? {
+        speech.quietNonSpeechMask(for: mediaRef, samples: samples(for: mediaRef))
     }
 
     nonisolated func thumbnails(for mediaRef: String) -> [(time: Double, image: CGImage)]? {
@@ -47,37 +80,48 @@ final class MediaVisualCache {
     // MARK: - Async generation
 
     func generateWaveform(for asset: MediaAsset) {
+        guard asset.type == .audio || (asset.type == .video && asset.hasAudio) else { return }
+        speech.generate(for: asset)
+        beats.hydrate(for: asset)
         let key = asset.id
         guard waveformSamples[key] == nil, !waveformInFlight.contains(key) else { return }
         waveformInFlight.insert(key)
 
         let url = asset.url
         Task.detached(priority: .utility) { [weak self] in
-            let cacheKey = Self.diskCacheKey(for: url)
-            var result = cacheKey.flatMap(Self.loadWaveform(key:))
-            if result == nil {
-                // Gate only the analysis; cached reads shouldn't queue behind extractions.
-                await Self.waveformGate.wait()
-                defer { Task { await Self.waveformGate.signal() } }
-                let analyzer = WaveformAnalyzer()
-                let duration = (try? await AVURLAsset(url: url).load(.duration).seconds) ?? 0
-                let count = Self.waveformSampleCount(duration: duration)
-                result = try? await analyzer.samples(fromAudioAt: url, count: count)
-                if let result, let cacheKey {
-                    Self.saveWaveform(result, key: cacheKey)
-                }
-            }
+            let result = await Self.loadOrGenerateWaveform(url: url)
             guard let self else { return }
             await MainActor.run { [self] in
                 self.waveformInFlight.remove(key)
                 if let result {
                     self.waveformSamples[key] = result
                     self.timelineView?.needsDisplay = true
-                } else {
-                    Log.preview.error("waveform gen FAILED key=\(key.prefix(8)) url=\(url.lastPathComponent)")
                 }
             }
         }
+    }
+
+    /// Drops all in-memory state after a disk-cache clear so everything regenerates.
+    func resetSessionState() {
+        waveformSamples.removeAll()
+        speakerMasks.removeAll()
+        speech.reset()
+        beats.reset()
+        videoThumbnails.removeAll()
+        imageThumbnails.removeAll()
+        onDeadAirCacheInvalidated?()
+        timelineView?.needsDisplay = true
+    }
+
+    /// Clears every cached visual for `mediaRef` so relinked media regenerates.
+    func invalidate(_ mediaRef: String) {
+        waveformSamples.removeValue(forKey: mediaRef)
+        speakerMasks.removeValue(forKey: mediaRef)
+        speech.invalidate(mediaRef)
+        beats.invalidate(mediaRef)
+        videoThumbnails.removeValue(forKey: mediaRef)
+        imageThumbnails.removeValue(forKey: mediaRef)
+        onDeadAirCacheInvalidated?()
     }
 
     func generateImageThumbnail(for asset: MediaAsset) {
@@ -87,7 +131,12 @@ final class MediaVisualCache {
 
         let url = asset.url
         Task.detached(priority: .utility) { [weak self] in
-            await Self.imageThumbnailGate.wait()
+            do {
+                try await Self.imageThumbnailGate.wait()
+            } catch {
+                await MainActor.run { [weak self] in _ = self?.imageThumbnailInFlight.remove(key) }
+                return
+            }
             defer { Task { await Self.imageThumbnailGate.signal() } }
 
             let thumbnail = Self.makeImageThumbnail(url: url)
@@ -109,35 +158,45 @@ final class MediaVisualCache {
 
         let url = asset.url
         Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                try await Self.videoThumbnailGate.wait()
+            } catch {
+                await MainActor.run { [weak self] in _ = self?.videoThumbnailInFlight.remove(key) }
+                return
+            }
+            defer { Task { await Self.videoThumbnailGate.signal() } }
+
             let cacheKey = Self.diskCacheKey(for: url)
             var results = cacheKey.flatMap(Self.loadThumbnails(key:)) ?? []
 
             if results.isEmpty {
                 let avAsset = AVURLAsset(url: url)
-                let duration = (try? await avAsset.load(.duration).seconds) ?? 0
-                let times = Self.videoThumbnailTimes(duration: duration)
+                if (try? await avAsset.loadTracks(withMediaType: .video).first) != nil {
+                    let duration = (try? await avAsset.load(.duration).seconds) ?? 0
+                    let times = Self.videoThumbnailTimes(duration: duration)
 
-                if !times.isEmpty {
-                    let generator = AVAssetImageGenerator(asset: avAsset)
-                    generator.maximumSize = CGSize(width: 120, height: 68)
-                    generator.appliesPreferredTrackTransform = true
-                    generator.requestedTimeToleranceBefore = CMTime(seconds: 1.0, preferredTimescale: 600)
-                    generator.requestedTimeToleranceAfter = CMTime(seconds: 1.0, preferredTimescale: 600)
+                    if !times.isEmpty {
+                        let generator = AVAssetImageGenerator(asset: avAsset)
+                        generator.maximumSize = CGSize(width: 120, height: 68)
+                        generator.appliesPreferredTrackTransform = true
+                        generator.requestedTimeToleranceBefore = CMTime(seconds: 1.0, preferredTimescale: 600)
+                        generator.requestedTimeToleranceAfter = CMTime(seconds: 1.0, preferredTimescale: 600)
 
-                    for await result in generator.images(for: times) {
-                        if case .success(requestedTime: let requestedTime, image: let image, actualTime: _) = result {
-                            results.append((time: requestedTime.seconds, image: image))
-                            // Publish progressively so long videos fill in instead of appearing at the end.
-                            if results.count % 50 == 0, let self {
-                                let partial = results
-                                await MainActor.run { [self] in
-                                    self.videoThumbnails[key] = partial
-                                    self.timelineView?.needsDisplay = true
+                        for await result in generator.images(for: times) {
+                            if case .success(requestedTime: let requestedTime, image: let image, actualTime: _) = result {
+                                results.append((time: requestedTime.seconds, image: image))
+                                // Publish progressively so long videos fill in instead of appearing at the end.
+                                if results.count % 50 == 0, let self {
+                                    let partial = results
+                                    await MainActor.run { [self] in
+                                        self.videoThumbnails[key] = partial
+                                        self.timelineView?.needsDisplay = true
+                                    }
                                 }
                             }
                         }
+                        results.sort { $0.time < $1.time }
                     }
-                    results.sort { $0.time < $1.time }
                 }
 
                 if !results.isEmpty, let cacheKey {
@@ -169,10 +228,23 @@ final class MediaVisualCache {
         return CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary)
     }
 
-    private nonisolated static func waveformSampleCount(duration: Double) -> Int {
-        guard duration.isFinite, duration > 0 else { return 4000 }
-        if duration >= Double(20_000) / 150 { return 20_000 }
-        return max(4000, Int(duration * 150))
+    private nonisolated static func loadOrGenerateWaveform(url: URL) async -> [Float]? {
+        let cacheKey = diskCacheKey(for: url)
+        if let cacheKey, let cached = loadWaveform(key: cacheKey) { return cached }
+
+        do {
+            try await waveformGate.wait()
+        } catch {
+            return nil
+        }
+        defer { Task { await waveformGate.signal() } }
+
+        let asset = AVURLAsset(url: url)
+        guard (try? await asset.loadTracks(withMediaType: .audio).first) != nil else { return nil }
+
+        guard let samples = try? await WaveformExtractor.peakEnvelope(from: url), !samples.isEmpty else { return nil }
+        if let cacheKey { saveWaveform(samples, key: cacheKey) }
+        return samples
     }
 
     private nonisolated static func videoThumbnailTimes(duration: Double) -> [CMTime] {
@@ -202,13 +274,13 @@ final class MediaVisualCache {
     }
 
     private nonisolated static func loadWaveform(key: String) -> [Float]? {
-        let url = diskCache.directory.appendingPathComponent(key + ".waveform")
+        let url = diskCache.directory.appendingPathComponent(key + ".waveform2")
         guard let data = try? Data(contentsOf: url), !data.isEmpty, data.count % 4 == 0 else { return nil }
         return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     }
 
     private nonisolated static func saveWaveform(_ samples: [Float], key: String) {
-        let url = diskCache.directory.appendingPathComponent(key + ".waveform")
+        let url = diskCache.directory.appendingPathComponent(key + ".waveform2")
         samples.withUnsafeBytes { try? Data($0).write(to: url) }
     }
 

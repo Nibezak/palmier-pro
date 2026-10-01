@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Palmier Pro releases through v0.7.6, and source code through [`last-gpl-source`](https://github.com/palmier-io/palmier-pro/tree/last-gpl-source), were published under GPLv3. Later binary releases are proprietary, and their corresponding source is not published. This repository preserves the historical source and hosts current binary releases and update metadata.
+
 <div align="center">
 
 # Palmier Pro
@@ -5,21 +8,40 @@
 **The video editor built for AI.**
 
 <a href="https://github.com/palmier-io/palmier-pro/releases/latest/download/PalmierPro.dmg">
-  <img src="./assets/macos-badge.png" alt="Download palmierpro for macOS" width="180" />
+  <img src="./assets/macos-badge.png" alt="Download Palmier Pro for macOS" width="180" />
 </a>
 
 <sub><i>Requires macOS 26 (Tahoe) on Apple Silicon</i></sub>
 
-<a href="https://x.com/Palmier_io"><img src="https://img.shields.io/badge/Follow-%40palmierio-000000?style=flat&logo=x&logoColor=white" alt="Follow on X" /></a>
+<a href="https://x.com/Palmier_io"><img src="https://img.shields.io/badge/Follow-%40Palmier__io-000000?style=flat&logo=x&logoColor=white" alt="Follow on X" /></a>
 <a href="https://discord.com/invite/SMVW6pKYmg"><img src="https://img.shields.io/badge/Join-Discord-5865F2?style=flat&logo=discord&logoColor=white" alt="Join Discord" /></a>
+<a href="https://www.ycombinator.com/companies/palmier"><img src="https://img.shields.io/badge/Y%20Combinator-S24-orange" alt="Y Combinator S24" /></a>
+
+<p>
+  <strong>English</strong> ·
+  <a href="docs/readme/README.es.md">Español</a> ·
+  <a href="docs/readme/README.zh-CN.md">简体中文</a> ·
+  <a href="docs/readme/README.zh-TW.md">繁體中文</a> ·
+  <a href="docs/readme/README.ja.md">日本語</a> ·
+  <a href="docs/readme/README.ko.md">한국어</a> ·
+  <a href="docs/readme/README.vi.md">Tiếng Việt</a> ·
+  <a href="docs/readme/README.hi.md">हिन्दी</a> ·
+  <a href="docs/readme/README.bn.md">বাংলা</a> ·
+  <a href="docs/readme/README.ar.md">العربية</a> ·
+  <a href="docs/readme/README.it.md">Italiano</a> ·
+  <a href="docs/readme/README.pt-BR.md">Português (Brasil)</a> ·
+  <a href="docs/readme/README.fr.md">Français</a> ·
+  <a href="docs/readme/README.ru.md">Русский</a> ·
+  <a href="docs/readme/README.tr.md">Türkçe</a>
+</p>
 
 </div>
 
-<img src="./assets/palmier-ui.png" alt="palmierpro UI" width="900" />
+<img src="./assets/palmier-ui.png" alt="Palmier Pro UI" width="900" />
 
 ---
 
-Palmier Pro is an open source video editor for Mac. You and your agent can generate and edit videos together inside the timeline.
+Palmier Pro is a macOS video editor with built-in AI generation and MCP support, allowing agents to create and edit directly on the timeline.
 
 ### Swift-native video editor
 
@@ -68,28 +90,29 @@ We bundle a [mcpb](https://github.com/modelcontextprotocol/mcpb) with the app th
 
 ## FAQ
 
-**Is Palmier Pro fully open source?**
+**Which versions of Palmier Pro are open source?**
 
-The video editor (without the generative AI features) is fully open source. The MCP server and the agent chat are also open source. The only thing that is closed source is the generative AI processing.
-
-**Is it free?**
-
-The editor is free. You can download it with no login required, and use it as a video editor like CapCut or Adobe Premiere. You can also use the MCP server for free, and start experimenting using Claude Code/Desktop or Cursor to interact with your timeline editor.
-
-Generative AI features require login and subscription.
+Releases through v0.7.6 and source through `last-gpl-source` remain available under GPLv3. Later releases are proprietary.
 
 **What platforms does it support?**
 
-macOS 26 (Tahoe) on Apple Silicon only.
+macOS 26 (Tahoe) or later on Apple Silicon (M series) only.
 
-See [FAQ.md](FAQ.md) for more.
+## Contributing
 
-## Development
+This repository no longer accepts code contributions. The published source remains available for use, modification, and redistribution under GPLv3.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md)
+## Community &amp; Support
+
+- **Discord:** Join the community on **[Discord](https://discord.com/invite/SMVW6pKYmg)**.
+- **Twitter / X:** Follow **[@Palmier_io](https://x.com/Palmier_io)** for updates and announcements.
+- **Instagram:** Follow [@palmier.io](https://www.instagram.com/palmier.io) 
+- **Feedback &amp; Support:** Email founders@palmier.io.
 
 ## License
 
 Copyright (C) 2026 Palmier, Inc.
 
-Palmier Pro is open source under [GPLv3](LICENSE).
+The source code published in this repository remains available under [GPLv3](LICENSE).
+
+Palmier Pro binary releases after v0.7.6 are proprietary and subject to the [binary license](BINARY_LICENSE.md).

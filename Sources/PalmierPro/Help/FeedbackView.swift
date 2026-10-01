@@ -15,6 +15,11 @@ struct FeedbackView: View {
 
     let screenshot: Data?
 
+    init(screenshot: Data?, prefill: String = "") {
+        self.screenshot = screenshot
+        _message = State(initialValue: prefill)
+    }
+
     private static let maxMessageLen = 10_000
 
     private var trimmedMessage: String {
@@ -81,7 +86,7 @@ struct FeedbackView: View {
 
     private var descriptionField: some View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.xs) {
-            fieldLabel("Describe the issue or feedback")
+            fieldLabel(L10n.string("Describe the issue or feedback"))
             TextEditor(text: $message)
                 .font(.system(size: AppTheme.FontSize.md))
                 .foregroundStyle(AppTheme.Text.primaryColor)
@@ -102,8 +107,8 @@ struct FeedbackView: View {
 
     private var emailField: some View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.xs) {
-            fieldLabel("Email (optional)")
-            TextField("", text: $email, prompt: Text("you@example.com — so we can reply"))
+            fieldLabel(L10n.string("Email (optional)"))
+            TextField(String(), text: $email, prompt: Text(L10n.string("you@example.com — so we can reply")))
                 .textFieldStyle(.plain)
                 .font(.system(size: AppTheme.FontSize.md))
                 .foregroundStyle(AppTheme.Text.primaryColor)
@@ -122,19 +127,19 @@ struct FeedbackView: View {
 
     private var mayContactRow: some View {
         Toggle(isOn: $mayContact) {
-            Text("We may email you for follow-up questions")
+            Text(L10n.string("We may email you for follow-up questions"))
                 .font(.system(size: AppTheme.FontSize.md))
                 .foregroundStyle(hasReplyEmail ? AppTheme.Text.secondaryColor : AppTheme.Text.tertiaryColor)
         }
         .toggleStyle(.checkbox)
         .disabled(!hasReplyEmail)
-        .help(hasReplyEmail ? "" : "Add an email above to enable a reply")
+        .help(hasReplyEmail ? String() : L10n.string("Add an email above to enable a reply"))
     }
 
     private var screenshotRow: some View {
         HStack(alignment: .center, spacing: AppTheme.Spacing.mdLg) {
             Toggle(isOn: $includeScreenshot) {
-                Text("Include screenshot")
+                Text(L10n.string("Include screenshot"))
                     .font(.system(size: AppTheme.FontSize.md))
                     .foregroundStyle(AppTheme.Text.secondaryColor)
             }
@@ -163,7 +168,7 @@ struct FeedbackView: View {
             Image(systemName: "info.circle")
                 .font(.system(size: AppTheme.FontSize.xs))
                 .foregroundStyle(AppTheme.Text.tertiaryColor)
-            Text(contextNoteText)
+            Text(verbatim: contextNoteText)
                 .font(.system(size: AppTheme.FontSize.xs))
                 .foregroundStyle(AppTheme.Text.tertiaryColor)
                 .fixedSize(horizontal: false, vertical: true)
@@ -171,17 +176,13 @@ struct FeedbackView: View {
     }
 
     private var contextNoteText: String {
-        if account.isSignedIn {
-            return "App version \(Self.appVersion) and macOS \(Self.osVersion) are included."
-        } else {
-            return "App version \(Self.appVersion) and macOS \(Self.osVersion) are included."
-        }
+        L10n.string("App version \(Self.appVersion) and macOS \(Self.osVersion) are included.")
     }
 
     private var footer: some View {
         HStack(spacing: AppTheme.Spacing.smMd) {
             Spacer()
-            Button("Cancel") { dismiss() }
+            Button(L10n.string("Cancel")) { dismiss() }
                 .buttonStyle(.capsule(.secondary, size: .regular))
                 .controlSize(.large)
                 .disabled(isSending)
@@ -193,7 +194,7 @@ struct FeedbackView: View {
                             .controlSize(.small)
                             .tint(AppTheme.Text.primaryColor)
                     }
-                    Text(isSending ? "Sending…" : "Send")
+                    Text(isSending ? L10n.string("Sending…") : L10n.string("Send"))
                 }
             }
             .buttonStyle(.capsule(.prominent, size: .regular))
@@ -210,17 +211,17 @@ struct FeedbackView: View {
             HStack(spacing: AppTheme.Spacing.xs) {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(AppTheme.Accent.primary)
-                Text("Thanks for the feedback.")
+                Text(L10n.string("Thanks for the feedback."))
                     .font(.system(size: AppTheme.FontSize.md, weight: .medium))
                     .foregroundStyle(AppTheme.Text.primaryColor)
             }
-            Text(successDetailText)
+            Text(verbatim: successDetailText)
                 .font(.system(size: AppTheme.FontSize.sm))
                 .foregroundStyle(AppTheme.Text.tertiaryColor)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
-                Button("Done") { dismiss() }
+                Button(L10n.string("Done")) { dismiss() }
                     .buttonStyle(.capsule(.prominent, size: .regular))
                     .controlSize(.large)
                     .keyboardShortcut(.defaultAction)
@@ -232,12 +233,12 @@ struct FeedbackView: View {
         let replyAddr = account.account?.user.email
             ?? (trimmedEmail.isEmpty ? nil : trimmedEmail)
         if let replyAddr, mayContact {
-            return "We read every message and may reach out at \(replyAddr)."
+            return L10n.string("We read every message and may reach out at \(replyAddr).")
         }
         if replyAddr != nil {
-            return "We read every message. We won't email you, as requested."
+            return L10n.string("We read every message. We won't email you, as requested.")
         }
-        return "We read every message. Add an email next time if you'd like a reply."
+        return L10n.string("We read every message. Add an email next time if you'd like a reply.")
     }
 
     // MARK: - Helpers
@@ -293,12 +294,11 @@ final class FeedbackWindowController: NSWindowController {
 
     private init() {
         let initialView = FeedbackView(screenshot: nil).tint(AppTheme.Accent.primary)
-        let hosting = NSHostingController(rootView: AnyView(initialView))
+        let hosting = NSHostingController(rootView: AnyView(initialView.appLocalization()))
         let window = NSWindow(contentViewController: hosting)
         window.setContentSize(NSSize(width: 480, height: 480))
         window.minSize = NSSize(width: 480, height: 420)
-        window.title = "Send feedback"
-        window.appearance = NSAppearance(named: .darkAqua)
+        window.title = L10n.string("Send feedback")
         window.backgroundColor = AppTheme.Background.base.withAlphaComponent(0.4)
         window.isOpaque = false
         window.titleVisibility = .hidden
@@ -314,12 +314,13 @@ final class FeedbackWindowController: NSWindowController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    func show() {
+    func show(prefill: String = "") {
         // Capture BEFORE the feedback window becomes key so it isn't in the shot.
         let screenshot = FeedbackScreenshot.captureMainWindow()
         hosting?.rootView = AnyView(
-            FeedbackView(screenshot: screenshot)
+            FeedbackView(screenshot: screenshot, prefill: prefill)
                 .id(UUID())
+                .appLocalization()
                 .tint(AppTheme.Accent.primary)
         )
         showWindow(nil)

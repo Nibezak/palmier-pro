@@ -2,18 +2,44 @@ import AVFoundation
 import Foundation
 import Speech
 
+enum TranscriptionProvider: String, CaseIterable, Sendable, Codable {
+    case local
+    case cloud
+
+    var label: String {
+        switch self {
+        case .local: L10n.key("Local")
+        case .cloud: L10n.key("Cloud")
+        }
+    }
+}
+
 struct TranscriptionWord: Sendable, Codable {
     let text: String
     let start: Double?
     let end: Double?
+    let speaker: String?
+
+    init(text: String, start: Double?, end: Double?, speaker: String? = nil) {
+        self.text = text
+        self.start = start
+        self.end = end
+        self.speaker = speaker
+    }
 }
 
-/// One natural utterance the transcriber endpointed on its own (pause/sentence
-/// boundary). `text` carries the model's punctuation and casing.
 struct TranscriptionSegment: Sendable, Codable {
     let text: String
     let start: Double
     let end: Double
+    let speaker: String?
+
+    init(text: String, start: Double, end: Double, speaker: String? = nil) {
+        self.text = text
+        self.start = start
+        self.end = end
+        self.speaker = speaker
+    }
 }
 
 struct TranscriptionResult: Sendable, Codable {
@@ -29,10 +55,15 @@ struct TranscriptionResult: Sendable, Codable {
             text: text,
             language: language,
             words: words.map {
-                TranscriptionWord(text: $0.text, start: $0.start.map { $0 + offset }, end: $0.end.map { $0 + offset })
+                TranscriptionWord(
+                    text: $0.text,
+                    start: $0.start.map { $0 + offset },
+                    end: $0.end.map { $0 + offset },
+                    speaker: $0.speaker
+                )
             },
             segments: segments.map {
-                TranscriptionSegment(text: $0.text, start: $0.start + offset, end: $0.end + offset)
+                TranscriptionSegment(text: $0.text, start: $0.start + offset, end: $0.end + offset, speaker: $0.speaker)
             }
         )
     }
@@ -62,7 +93,18 @@ enum TranscriptionError: LocalizedError {
 }
 
 enum Transcription {
+    private static let audioExtractionGate = AsyncSemaphore(value: 2)
+
+    static func failurePreservingCancellation(
+        _ error: Error,
+        as makeFailure: (String) -> TranscriptionError
+    ) throws -> TranscriptionError {
+        try Task.checkCancellation()
+        return makeFailure(error.localizedDescription)
+    }
+
     static func transcribeVideoAudio(videoURL: URL, censorProfanity: Bool = false, preferredLocale: Locale? = nil, sourceRange: ClosedRange<Double>? = nil) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
         let tempAudioURL = try await extractAudioTrack(from: videoURL, range: sourceRange)
         defer { try? FileManager.default.removeItem(at: tempAudioURL) }
         let result = try await transcribe(fileURL: tempAudioURL, censorProfanity: censorProfanity, preferredLocale: preferredLocale)
@@ -80,16 +122,22 @@ enum Transcription {
 
     static func matchLocale(candidates: [Locale], supported: [Locale]) -> Locale? {
         for candidate in candidates {
-            guard let lang = candidate.language.languageCode?.identifier else { continue }
+            // Strip Unicode extension tags (e.g. -u-rg-zazzzz from en-US-u-rg-zazzzz) before
+            // matching — the Speech framework doesn't recognise composite BCP 47 tags.
+            let baseId = candidate.identifier(.bcp47).components(separatedBy: "-u-").first
+                ?? candidate.identifier
+            let base = Locale(identifier: baseId)
+            guard let lang = base.language.languageCode?.identifier else { continue }
             let sameLang = supported.filter { $0.language.languageCode?.identifier == lang }
             guard !sameLang.isEmpty else { continue }
-            let region = candidate.region?.identifier
+            let region = base.region?.identifier
             return sameLang.first { $0.region?.identifier == region } ?? sameLang.first
         }
         return nil
     }
 
     static func transcribe(fileURL: URL, censorProfanity: Bool = false, preferredLocale: Locale? = nil, sourceRange: ClosedRange<Double>? = nil) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
         if let sourceRange {
             let tempURL = try await extractAudioTrack(from: fileURL, range: sourceRange)
             defer { try? FileManager.default.removeItem(at: tempURL) }
@@ -106,7 +154,15 @@ enum Transcription {
         } else {
             throw TranscriptionError.unsupportedLocale((preferredLocale ?? Locale.current).identifier(.bcp47))
         }
-        Log.transcription.notice("transcribe locale=\(locale.identifier(.bcp47))")
+        Log.transcription.notice(
+            "transcribe locale=\(locale.identifier(.bcp47))",
+            telemetry: "Transcription started",
+            data: [
+                "locale": locale.identifier(.bcp47),
+                "censorProfanity": censorProfanity,
+                "hasPreferredLocale": preferredLocale != nil
+            ]
+        )
 
         let transcriber = SpeechTranscriber(
             locale: locale,
@@ -116,20 +172,34 @@ enum Transcription {
         )
 
         if let install = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            Log.transcription.notice("install model start locale=\(locale.identifier)")
+            Log.transcription.notice(
+                "install model start locale=\(locale.identifier)",
+                telemetry: "Transcription model install started",
+                data: ["locale": locale.identifier(.bcp47)]
+            )
             do {
                 try await install.downloadAndInstall()
             } catch {
-                throw TranscriptionError.modelInstallFailed(error.localizedDescription)
+                let failure = try failurePreservingCancellation(error, as: TranscriptionError.modelInstallFailed)
+                Log.transcription.warning(
+                    "install model failed locale=\(locale.identifier) error=\(error.localizedDescription)",
+                    telemetry: "Transcription model install failed",
+                    data: ["locale": locale.identifier(.bcp47), "error": error.localizedDescription]
+                )
+                throw failure
             }
-            Log.transcription.notice("install model ok locale=\(locale.identifier)")
+            Log.transcription.notice(
+                "install model ok locale=\(locale.identifier)",
+                telemetry: "Transcription model install finished",
+                data: ["locale": locale.identifier(.bcp47)]
+            )
         }
 
         let audioFile: AVAudioFile
         do {
             audioFile = try AVAudioFile(forReading: fileURL)
         } catch {
-            throw TranscriptionError.audioExtractionFailed(error.localizedDescription)
+            throw try failurePreservingCancellation(error, as: TranscriptionError.audioExtractionFailed)
         }
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
@@ -140,7 +210,7 @@ enum Transcription {
             return acc
         }
 
-        Log.transcription.notice("analyze start file=\(fileURL.lastPathComponent)")
+        Log.transcription.notice("analyze start file=\(fileURL.lastPathComponent)", telemetry: "Transcription analysis started")
         do {
             if let lastSampleTime = try await analyzer.analyzeSequence(from: audioFile) {
                 try await analyzer.finalizeAndFinish(through: lastSampleTime)
@@ -149,92 +219,89 @@ enum Transcription {
             }
         } catch {
             resultsTask.cancel()
-            throw TranscriptionError.analysisFailed(error.localizedDescription)
+            let failure = try failurePreservingCancellation(error, as: TranscriptionError.analysisFailed)
+            Log.transcription.warning(
+                "analyze failed error=\(error.localizedDescription)",
+                telemetry: "Transcription analysis failed",
+                data: ["error": error.localizedDescription]
+            )
+            throw failure
         }
 
         let collected: [SpeechTranscriber.Result]
         do {
             collected = try await resultsTask.value
         } catch {
-            throw TranscriptionError.analysisFailed(error.localizedDescription)
+            throw try failurePreservingCancellation(error, as: TranscriptionError.analysisFailed)
         }
 
         let decoded = decodeResults(collected, locale: locale)
+        try Task.checkCancellation()
         Log.transcription.notice(
-            "ok textChars=\(decoded.text.count) words=\(decoded.words.count) lang=\(decoded.language ?? "?")"
+            "ok textChars=\(decoded.text.count) words=\(decoded.words.count) lang=\(decoded.language ?? "?")",
+            telemetry: "Transcription finished",
+            data: [
+                "textChars": decoded.text.count,
+                "words": decoded.words.count,
+                "segments": decoded.segments.count,
+                "language": decoded.language ?? "unknown"
+            ]
         )
         return decoded
     }
 
     /// Decode the asset's audio track to a PCM file with AVAssetReader
-    private static func extractAudioTrack(from videoURL: URL, range: ClosedRange<Double>? = nil) async throws -> URL {
-        let asset = AVURLAsset(url: videoURL)
-        guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
-            throw TranscriptionError.audioExtractionFailed("No audio track in \(videoURL.lastPathComponent)")
-        }
-
-        let reader: AVAssetReader
-        do { reader = try AVAssetReader(asset: asset) } catch {
-            throw TranscriptionError.audioExtractionFailed(error.localizedDescription)
-        }
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: 16_000,
-            AVNumberOfChannelsKey: 1,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: false,
-        ])
-        guard reader.canAdd(output) else {
-            throw TranscriptionError.audioExtractionFailed("Cannot read audio from \(videoURL.lastPathComponent)")
-        }
-        reader.add(output)
-        if let range {
-            reader.timeRange = CMTimeRange(
-                start: CMTime(seconds: range.lowerBound, preferredTimescale: 600),
-                end: CMTime(seconds: range.upperBound, preferredTimescale: 600)
-            )
-        }
-
+    static func extractAudioTrack(
+        from videoURL: URL,
+        range: ClosedRange<Double>? = nil,
+        fileExtension: String = "caf"
+    ) async throws -> URL {
         let outURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("palmier-stt-\(UUID().uuidString).caf")
-        Log.transcription.notice("extract start video=\(videoURL.lastPathComponent)")
+            .appendingPathComponent("palmier-stt-\(UUID().uuidString).\(fileExtension)")
+        try await audioExtractionGate.wait()
+        defer { Task { await audioExtractionGate.signal() } }
 
-        guard reader.startReading() else {
-            throw TranscriptionError.audioExtractionFailed(reader.error?.localizedDescription ?? "Reader could not start")
-        }
+        Log.transcription.notice(
+            "extract start video=\(videoURL.lastPathComponent)",
+            telemetry: "Transcription audio extraction started",
+            data: ["hasRange": range != nil, "rangeSeconds": range.map { $0.upperBound - $0.lowerBound } ?? 0]
+        )
 
         var audioFile: AVAudioFile?
-        while let sample = output.copyNextSampleBuffer() {
-            guard let desc = CMSampleBufferGetFormatDescription(sample),
-                  let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
-                  let format = AVAudioFormat(streamDescription: asbd) else { continue }
-            let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
-            guard frames > 0, let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { continue }
-            pcm.frameLength = frames
-            CMSampleBufferCopyPCMDataIntoAudioBufferList(
-                sample, at: 0, frameCount: Int32(frames), into: pcm.mutableAudioBufferList
-            )
-            if audioFile == nil {
-                audioFile = try AVAudioFile(
-                    forWriting: outURL,
-                    settings: format.settings,
-                    commonFormat: format.commonFormat,
-                    interleaved: format.isInterleaved
-                )
+        do {
+            try await AudioTrackReader.read(from: videoURL, outputSettings: [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 16_000,
+                AVNumberOfChannelsKey: 1,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ], range: range) { pcm in
+                if audioFile == nil {
+                    audioFile = try AVAudioFile(
+                        forWriting: outURL,
+                        settings: pcm.format.settings,
+                        commonFormat: pcm.format.commonFormat,
+                        interleaved: pcm.format.isInterleaved
+                    )
+                }
+                try audioFile?.write(from: pcm)
             }
-            try audioFile?.write(from: pcm)
+        } catch let error as AudioTrackReader.ReadError {
+            try Task.checkCancellation()
+            throw TranscriptionError.audioExtractionFailed(error.message)
         }
 
-        if reader.status == .failed {
-            throw TranscriptionError.audioExtractionFailed(reader.error?.localizedDescription ?? "Read failed")
-        }
         guard audioFile != nil else {
             throw TranscriptionError.audioExtractionFailed("No audio samples in \(videoURL.lastPathComponent)")
         }
         let bytes = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
-        Log.transcription.notice("extract ok bytes=\(bytes) out=\(outURL.lastPathComponent)")
+        Log.transcription.notice(
+            "extract ok bytes=\(bytes) out=\(outURL.lastPathComponent)",
+            telemetry: "Transcription audio extraction finished",
+            data: ["bytes": bytes, "hasRange": range != nil]
+        )
         return outURL
     }
 
@@ -257,7 +324,8 @@ enum Transcription {
                 segments.append(TranscriptionSegment(
                     text: segmentText,
                     start: result.range.start.seconds,
-                    end: result.range.end.seconds
+                    end: result.range.end.seconds,
+                    speaker: nil
                 ))
             }
 
@@ -268,7 +336,7 @@ enum Transcription {
                 let range = run.audioTimeRange
                 let start = range.map(\.start.seconds)
                 let end = range.map { ($0.start + $0.duration).seconds }
-                words.append(TranscriptionWord(text: trimmed, start: start, end: end))
+                words.append(TranscriptionWord(text: trimmed, start: start, end: end, speaker: nil))
             }
         }
 

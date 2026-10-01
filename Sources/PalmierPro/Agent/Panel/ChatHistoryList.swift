@@ -15,7 +15,7 @@ struct ChatHistoryList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if sessions.isEmpty {
-                Text("No conversations yet")
+                Text(L10n.string("No conversations yet"))
                     .font(.system(size: AppTheme.FontSize.xs))
                     .foregroundStyle(AppTheme.Text.mutedColor)
                     .padding(AppTheme.Spacing.md)
@@ -46,7 +46,7 @@ struct ChatHistoryList: View {
                         .lineLimit(1)
                 }
                 Text(Self.formatter.localizedString(for: session.updatedAt, relativeTo: Date()))
-                    .font(.system(size: 9))
+                    .font(.system(size: AppTheme.FontSize.xxs))
                     .foregroundStyle(AppTheme.Text.tertiaryColor)
             }
             Spacer()
@@ -58,7 +58,7 @@ struct ChatHistoryList: View {
                 }
                 .buttonStyle(.plain)
                 .focusable(false)
-                .help("Delete from history")
+                .help(L10n.string("Delete from history"))
             }
         }
         .padding(.horizontal, AppTheme.Spacing.md)

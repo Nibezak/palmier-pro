@@ -4,12 +4,38 @@ import SwiftUI
 struct AgentMessageView: View {
     let message: AgentMessage
     let toolResults: [String: ToolRunResult]
+    @State private var isHovering = false
 
     var body: some View {
         switch message.role {
         case .user:   userBody
         case .assistant: assistantBody
+        case .system: systemBody
         }
+    }
+
+    @ViewBuilder
+    private var systemBody: some View {
+        let texts = message.blocks.compactMap { block -> String? in
+            if case let .text(s) = block { return s }
+            return nil
+        }
+        if !texts.isEmpty {
+            HStack {
+                Spacer(minLength: 0)
+                Text(verbatim: texts.joined(separator: "\n"))
+                    .font(.system(size: AppTheme.FontSize.xs))
+                    .foregroundStyle(AppTheme.Text.tertiaryColor)
+                    .multilineTextAlignment(.center)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var copyableText: String {
+        message.blocks
+            .compactMap { if case let .text(s) = $0 { return s } else { return nil } }
+            .joined(separator: "\n\n")
     }
 
     @ViewBuilder
@@ -21,7 +47,7 @@ struct AgentMessageView: View {
         if !texts.isEmpty {
             HStack {
                 Spacer(minLength: 48)
-                Text(texts.joined(separator: "\n"))
+                Text(verbatim: texts.joined(separator: "\n"))
                     .font(.body)
                     .foregroundStyle(AppTheme.Text.primaryColor)
                     .lineSpacing(3)
@@ -29,7 +55,7 @@ struct AgentMessageView: View {
                     .padding(.vertical, AppTheme.Spacing.smMd)
                     .background(
                         RoundedRectangle(cornerRadius: AppTheme.Radius.lg, style: .continuous)
-                            .fill(Color.white.opacity(AppTheme.Opacity.faint))
+                            .fill(AppTheme.Interaction.fill(AppTheme.Opacity.faint))
                     )
                     .textSelection(.enabled)
             }
@@ -42,6 +68,16 @@ struct AgentMessageView: View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.md) {
             ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
                 switch block {
+                case .thinking(let text, let signature):
+                    if !text.isEmpty {
+                        ThinkingSummaryView(text: text, isComplete: !signature.isEmpty)
+                    }
+                case .redactedThinking:
+                    EmptyView()
+                case .openAIReasoning(let summary, let encryptedContent, _, _):
+                    if !summary.isEmpty {
+                        ThinkingSummaryView(text: summary, isComplete: !encryptedContent.isEmpty)
+                    }
                 case .text(let text):
                     MarkdownText(text: text)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -51,7 +87,91 @@ struct AgentMessageView: View {
                     EmptyView()
                 }
             }
+            if !copyableText.isEmpty {
+                CopyMessageButton(text: copyableText)
+                    .opacity(isHovering ? 1 : 0)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onHover { isHovering = $0 }
+        .animation(.easeOut(duration: AppTheme.Anim.hover), value: isHovering)
+    }
+}
+
+private struct ThinkingSummaryView: View {
+    let text: String
+    let isComplete: Bool
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AppTheme.Spacing.xs) {
+            if isComplete {
+                Button {
+                    withAnimation(.easeOut(duration: AppTheme.Anim.hover)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    Image(systemName: isExpanded ? "brain.head.profile.fill" : "brain.head.profile")
+                        .font(.system(size: AppTheme.FontSize.xxs, weight: AppTheme.FontWeight.medium))
+                        .foregroundStyle(AppTheme.Text.tertiaryColor)
+                        .frame(width: AppTheme.IconSize.xxs, height: AppTheme.IconSize.xxs)
+                }
+                .buttonStyle(.plain)
+                .help(toggleLabel)
+                .accessibilityLabel(toggleLabel)
+            }
+
+            if !isComplete || isExpanded {
+                summary
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var toggleLabel: String {
+        isExpanded ? L10n.string("Hide reasoning") : L10n.string("Show reasoning")
+    }
+
+    private var summary: some View {
+        Text(verbatim: text)
+            .font(.system(size: AppTheme.FontSize.xs))
+            .foregroundStyle(AppTheme.Text.tertiaryColor)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, AppTheme.Spacing.md)
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(AppTheme.Border.subtleColor)
+                    .frame(width: AppTheme.BorderWidth.medium)
+            }
+            .textSelection(.enabled)
+    }
+}
+
+private struct CopyMessageButton: View {
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            copied = true
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1.5))
+                copied = false
+            }
+        } label: {
+            HStack(spacing: AppTheme.Spacing.xs) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                Text(copied ? L10n.string("Copied") : L10n.string("Copy"))
+            }
+            .font(.system(size: AppTheme.FontSize.xs))
+            .foregroundStyle(AppTheme.Text.tertiaryColor)
+        }
+        .buttonStyle(.plain)
+        .help(L10n.string("Copy message"))
     }
 }
 
@@ -115,7 +235,7 @@ private struct ToolRunRow: View {
                 .padding(AppTheme.Spacing.md)
                 .background(
                     RoundedRectangle(cornerRadius: AppTheme.Radius.md, style: .continuous)
-                        .fill(Color.white.opacity(AppTheme.Opacity.subtle))
+                        .fill(AppTheme.Interaction.fill(AppTheme.Opacity.subtle))
                 )
                 .textSelection(.enabled)
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -126,7 +246,7 @@ private struct ToolRunRow: View {
     @ViewBuilder
     private var argsSection: some View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.xs) {
-            Text("args").font(.system(size: AppTheme.FontSize.xxs)).foregroundStyle(AppTheme.Text.mutedColor)
+            Text(L10n.string("args")).font(.system(size: AppTheme.FontSize.xxs)).foregroundStyle(AppTheme.Text.mutedColor)
             Text(prettyPrinted(inputJSON))
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -135,7 +255,7 @@ private struct ToolRunRow: View {
     @ViewBuilder
     private func resultSection(_ r: ToolRunResult) -> some View {
         VStack(alignment: .leading, spacing: AppTheme.Spacing.xs) {
-            Text(r.isError ? "error" : "result")
+            Text(r.isError ? L10n.string("error") : L10n.string("result"))
                 .font(.system(size: AppTheme.FontSize.xxs))
                 .foregroundStyle(r.isError ? .red.opacity(AppTheme.Opacity.prominent) : AppTheme.Text.mutedColor)
             ForEach(Array(r.content.enumerated()), id: \.offset) { _, block in
@@ -152,7 +272,10 @@ private struct ToolRunRow: View {
     private func prettyPrinted(_ json: String) -> String {
         guard let data = json.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+              let pretty = try? JSONSerialization.data(
+                  withJSONObject: roundJSONFloatingPointNumbers(obj, toPlaces: 3),
+                  options: [.prettyPrinted]
+              ),
               let s = String(data: pretty, encoding: .utf8),
               !s.isEmpty, s != "{}" else {
             return "(no args)"
@@ -175,7 +298,7 @@ private struct ToolResultImageView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .clipShape(RoundedRectangle(cornerRadius: AppTheme.Radius.sm, style: .continuous))
             } else {
-                Text("(image payload)").foregroundStyle(AppTheme.Text.mutedColor)
+                Text(L10n.string("(image payload)")).foregroundStyle(AppTheme.Text.mutedColor)
             }
         }
         .task(id: base64) {

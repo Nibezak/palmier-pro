@@ -5,7 +5,7 @@ struct CropOverlayView: View {
 
     private let handleSize: CGFloat = AppTheme.Spacing.smMd
     private let borderColor = AppTheme.Accent.timecodeColor
-    private let dimColor = Color.black.opacity(AppTheme.Opacity.strong)
+    private let dimColor = AppTheme.MediaOverlay.backgroundColor.opacity(AppTheme.Opacity.strong)
     private let guideColor = AppTheme.Accent.timecodeColor.opacity(AppTheme.Opacity.medium)
 
     var body: some View {
@@ -14,47 +14,54 @@ struct CropOverlayView: View {
 
             if let clip = selectedClip {
                 let frame = editor.activeFrame
-                let clipRect = clipFrame(clip.transformAt(frame: frame), videoRect: videoRect)
+                let transform = clip.transformAt(frame: frame)
+                let clipRect = clipFrame(transform, videoRect: videoRect)
                 let cropRect = cropFrame(clip.cropAt(frame: frame), in: clipRect)
 
-                Canvas { ctx, _ in
-                    let dim = GraphicsContext.Shading.color(dimColor)
-                    ctx.fill(Path(CGRect(x: clipRect.minX, y: clipRect.minY, width: clipRect.width, height: cropRect.minY - clipRect.minY)), with: dim)
-                    ctx.fill(Path(CGRect(x: clipRect.minX, y: cropRect.maxY, width: clipRect.width, height: clipRect.maxY - cropRect.maxY)), with: dim)
-                    ctx.fill(Path(CGRect(x: clipRect.minX, y: cropRect.minY, width: cropRect.minX - clipRect.minX, height: cropRect.height)), with: dim)
-                    ctx.fill(Path(CGRect(x: cropRect.maxX, y: cropRect.minY, width: clipRect.maxX - cropRect.maxX, height: cropRect.height)), with: dim)
+                ZStack {
+                    Canvas { ctx, _ in
+                        let dim = GraphicsContext.Shading.color(dimColor)
+                        ctx.fill(Path(CGRect(x: clipRect.minX, y: clipRect.minY, width: clipRect.width, height: cropRect.minY - clipRect.minY)), with: dim)
+                        ctx.fill(Path(CGRect(x: clipRect.minX, y: cropRect.maxY, width: clipRect.width, height: clipRect.maxY - cropRect.maxY)), with: dim)
+                        ctx.fill(Path(CGRect(x: clipRect.minX, y: cropRect.minY, width: cropRect.minX - clipRect.minX, height: cropRect.height)), with: dim)
+                        ctx.fill(Path(CGRect(x: cropRect.maxX, y: cropRect.minY, width: clipRect.maxX - cropRect.maxX, height: cropRect.height)), with: dim)
 
-                    var thirds = Path()
-                    for i in 1...2 {
-                        let f = CGFloat(i) / 3
-                        thirds.move(to: CGPoint(x: cropRect.minX + cropRect.width * f, y: cropRect.minY))
-                        thirds.addLine(to: CGPoint(x: cropRect.minX + cropRect.width * f, y: cropRect.maxY))
-                        thirds.move(to: CGPoint(x: cropRect.minX, y: cropRect.minY + cropRect.height * f))
-                        thirds.addLine(to: CGPoint(x: cropRect.maxX, y: cropRect.minY + cropRect.height * f))
+                        var thirds = Path()
+                        for i in 1...2 {
+                            let f = CGFloat(i) / 3
+                            thirds.move(to: CGPoint(x: cropRect.minX + cropRect.width * f, y: cropRect.minY))
+                            thirds.addLine(to: CGPoint(x: cropRect.minX + cropRect.width * f, y: cropRect.maxY))
+                            thirds.move(to: CGPoint(x: cropRect.minX, y: cropRect.minY + cropRect.height * f))
+                            thirds.addLine(to: CGPoint(x: cropRect.maxX, y: cropRect.minY + cropRect.height * f))
+                        }
+                        ctx.stroke(thirds, with: .color(guideColor), lineWidth: AppTheme.BorderWidth.thin)
+                        ctx.stroke(Path(cropRect), with: .color(borderColor), lineWidth: AppTheme.BorderWidth.medium)
                     }
-                    ctx.stroke(thirds, with: .color(guideColor), lineWidth: AppTheme.BorderWidth.thin)
-                    ctx.stroke(Path(cropRect), with: .color(borderColor), lineWidth: AppTheme.BorderWidth.medium)
-                }
-                .allowsHitTesting(false)
+                    .allowsHitTesting(false)
 
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .frame(width: cropRect.width, height: cropRect.height)
-                    .position(x: cropRect.midX, y: cropRect.midY)
-                    .onHover { hovering in
-                        if hovering { NSCursor.openHand.push() } else { NSCursor.pop() }
-                    }
-                    .gesture(panGesture(clip: clip, clipRect: clipRect))
-
-                ForEach(Corner.allCases, id: \.self) { corner in
-                    let pos = cornerPosition(corner, in: cropRect)
                     Rectangle()
-                        .fill(borderColor)
-                        .frame(width: handleSize, height: handleSize)
-                        .position(x: pos.x, y: pos.y)
-                        .gesture(resizeGesture(clip: clip, corner: corner, clipRect: clipRect))
+                        .fill(Color.clear)
+                        .contentShape(Rectangle())
+                        .frame(width: cropRect.width, height: cropRect.height)
+                        .position(x: cropRect.midX, y: cropRect.midY)
+                        .onHover { hovering in
+                            if hovering { NSCursor.openHand.push() } else { NSCursor.pop() }
+                        }
+                        .gesture(panGesture(clip: clip, clipRect: clipRect))
+
+                    ForEach(Corner.allCases, id: \.self) { corner in
+                        let pos = cornerPosition(corner, in: cropRect)
+                        Rectangle()
+                            .fill(borderColor)
+                            .frame(width: handleSize, height: handleSize)
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(resizeGesture(clip: clip, corner: corner, clipRect: clipRect))
+                    }
                 }
+                .frame(width: geo.size.width, height: geo.size.height)
+                // Match the clip's rotation about its center; gestures counter-rotate to stay in clip-local axes.
+                .rotationEffect(.degrees(transform.rotation),
+                                anchor: UnitPoint(x: clipRect.midX / geo.size.width, y: clipRect.midY / geo.size.height))
             }
         }
         .allowsHitTesting(selectedClip != nil)
@@ -65,19 +72,30 @@ struct CropOverlayView: View {
     @State private var dragStart: Crop?
 
     private func panGesture(clip: Clip, clipRect: CGRect) -> some Gesture {
-        DragGesture()
+        DragGesture(coordinateSpace: .global)
             .onChanged { value in
                 if dragStart == nil { dragStart = clip.cropAt(frame: editor.activeFrame) }
                 guard let start = dragStart else { return }
-                let updated = pannedCrop(start, by: value.translation, clipRect: clipRect)
+                let updated = pannedCrop(start, by: clipLocal(value.translation, clip: clip), clipRect: clipRect)
                 editor.applyCrop(clipId: clip.id, newCrop: updated)
             }
             .onEnded { value in
                 guard let start = dragStart else { return }
-                let updated = pannedCrop(start, by: value.translation, clipRect: clipRect)
+                let updated = pannedCrop(start, by: clipLocal(value.translation, clip: clip), clipRect: clipRect)
                 dragStart = nil
                 editor.commitCrop(clipId: clip.id, newCrop: updated)
             }
+    }
+
+    /// Rotate a screen-space drag delta into the clip's local (unrotated) axes, so crop math
+    /// stays correct when the clip's rotation tilts the overlay.
+    private func clipLocal(_ translation: CGSize, clip: Clip) -> CGSize {
+        let r = clip.transformAt(frame: editor.activeFrame).rotation * .pi / 180
+        let c = cos(r), s = sin(r)
+        return CGSize(
+            width:  translation.width * c + translation.height * s,
+            height: -translation.width * s + translation.height * c
+        )
     }
 
     private func pannedCrop(_ start: Crop, by translation: CGSize, clipRect: CGRect) -> Crop {
@@ -92,16 +110,16 @@ struct CropOverlayView: View {
     }
 
     private func resizeGesture(clip: Clip, corner: Corner, clipRect: CGRect) -> some Gesture {
-        DragGesture()
+        DragGesture(coordinateSpace: .global)
             .onChanged { value in
                 if dragStart == nil { dragStart = clip.cropAt(frame: editor.activeFrame) }
                 guard let start = dragStart else { return }
-                let updated = resizedCrop(start, corner: corner, by: value.translation, clipRect: clipRect, clip: clip)
+                let updated = resizedCrop(start, corner: corner, by: clipLocal(value.translation, clip: clip), clipRect: clipRect, clip: clip)
                 editor.applyCrop(clipId: clip.id, newCrop: updated)
             }
             .onEnded { value in
                 guard let start = dragStart else { return }
-                let updated = resizedCrop(start, corner: corner, by: value.translation, clipRect: clipRect, clip: clip)
+                let updated = resizedCrop(start, corner: corner, by: clipLocal(value.translation, clip: clip), clipRect: clipRect, clip: clip)
                 dragStart = nil
                 editor.commitCrop(clipId: clip.id, newCrop: updated)
             }
@@ -109,7 +127,7 @@ struct CropOverlayView: View {
 
     private func resizedCrop(_ start: Crop, corner: Corner, by translation: CGSize, clipRect: CGRect, clip: Clip) -> Crop {
         guard clipRect.width > 0, clipRect.height > 0 else { return start }
-        let minVis = 0.05
+        let minVis = Crop.minimumVisibleFraction
         if let aspectN = lockedAspectNormalized(for: clip) {
             return resizedCropLocked(start, corner: corner, translation: translation, clipRect: clipRect, aspectN: aspectN, minVis: minVis)
         }
@@ -182,15 +200,9 @@ struct CropOverlayView: View {
 
     private func lockedAspectNormalized(for clip: Clip) -> Double? {
         guard let target = editor.cropAspectLock.pixelAspect,
-              let srcAspect = sourcePixelAspect(for: clip), srcAspect > 0 else { return nil }
+              let dimensions = editor.sourceDimensions(for: clip) else { return nil }
+        let srcAspect = Double(dimensions.width) / Double(dimensions.height)
         return target / srcAspect
-    }
-
-    private func sourcePixelAspect(for clip: Clip) -> Double? {
-        guard let asset = editor.mediaAssets.first(where: { $0.id == clip.mediaRef }),
-              let sw = asset.sourceWidth, let sh = asset.sourceHeight,
-              sw > 0, sh > 0 else { return nil }
-        return Double(sw) / Double(sh)
     }
 
     // MARK: - Layout

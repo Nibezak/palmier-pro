@@ -56,6 +56,47 @@ struct FolderReadTests {
         #expect(e.assetsIn(folderId: folderId).map(\.name) == ["in"])
         #expect(e.assetsIn(folderId: nil).map(\.name) == ["out"])
     }
+
+    @Test func importFinderItemsMirrorsFolderTree() async throws {
+        let e = editor()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("folder-import-\(UUID().uuidString)", isDirectory: true)
+        let nested = root.appendingPathComponent("Nested", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data().write(to: root.appendingPathComponent("root.mp4"))
+        try Data().write(to: nested.appendingPathComponent("child.wav"))
+        try Data().write(to: nested.appendingPathComponent("ignored.txt"))
+
+        let summary = try await e.importFinderItems([root], into: nil)
+
+        #expect(summary.assetCount == 2)
+        #expect(summary.folderCount == 2)
+        let rootFolder = try #require(e.folders.first { $0.name == root.lastPathComponent })
+        let nestedFolder = try #require(e.folders.first { $0.name == "Nested" })
+        #expect(nestedFolder.parentFolderId == rootFolder.id)
+        #expect(e.assetsIn(folderId: rootFolder.id).map(\.name) == ["root"])
+        #expect(e.assetsIn(folderId: nestedFolder.id).map(\.name) == ["child"])
+    }
+
+    @Test func importFinderItemsDoesNotCreateRootFolderWhenDirectoryCannotBeRead() async throws {
+        let e = editor()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("folder-import-denied-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: root.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let summary = try await e.importFinderItems([root], into: nil)
+
+        #expect(summary.assetCount == 0)
+        #expect(summary.folderCount == 0)
+        #expect(e.folders.isEmpty)
+    }
 }
 
 @Suite("EditorViewModel — deleteFolders")
@@ -539,50 +580,187 @@ struct MoveMediaSelectionTests {
     }
 }
 
+@Suite("Media panel interactions")
+@MainActor
+struct MediaPanelInteractionTests {
+    @Test func modifierFlagsUseMacSelectionConventions() {
+        #expect(MediaPanelSelectionMode(modifierFlags: []) == .replacing)
+        #expect(MediaPanelSelectionMode(modifierFlags: [.command]) == .toggling)
+        #expect(MediaPanelSelectionMode(modifierFlags: [.shift]) == .range)
+        #expect(MediaPanelSelectionMode(modifierFlags: [.command, .shift]) == .extendingRange)
+    }
+
+    @Test func commandAndShiftSelectionWorkAcrossKinds() {
+        let e = editor()
+        let folderId = e.createFolder(name: "Bin")
+        let first = asset(name: "first")
+        let second = asset(name: "second")
+        for clip in [first, second] { e.importMediaAsset(clip) }
+        let folderKey = MediaPanelItemKey.folder(folderId)
+        let timelineKey = MediaPanelItemKey.timeline(e.activeTimelineId)
+        e.mediaPanelOrderedItemIds = [folderKey, timelineKey, first.id, second.id]
+
+        e.selectMediaPanelItem(folderKey, mode: .replacing)
+        e.selectMediaPanelItem(second.id, mode: .toggling)
+
+        #expect(e.selectedFolderIds == [folderId])
+        #expect(e.selectedMediaAssetIds == [second.id])
+        #expect(e.mediaPanelSelectionAnchor == second.id)
+
+        e.selectMediaPanelItem(folderKey, mode: .replacing)
+        e.selectMediaPanelItem(first.id, mode: .range)
+
+        #expect(e.selectedFolderIds == [folderId])
+        #expect(e.selectedTimelineIds == [e.activeTimelineId])
+        #expect(e.selectedMediaAssetIds == [first.id])
+        #expect(e.mediaPanelSelectionAnchor == folderKey)
+    }
+
+    @Test func marqueeSelectionEstablishesAVisibleRangeAnchor() {
+        let e = editor()
+        let clips = (0..<3).map { asset(name: "clip-\($0)") }
+        for clip in clips { e.importMediaAsset(clip) }
+        e.mediaPanelOrderedItemIds = clips.map(\.id)
+        e.selectedMediaAssetIds = [clips[0].id, clips[1].id]
+        e.mediaPanelSelectionAnchor = nil
+
+        e.pruneMediaPanelSelectionAnchor()
+        e.selectMediaPanelItem(clips[2].id, mode: .range)
+
+        #expect(e.selectedMediaAssetIds == Set(clips.map(\.id)))
+        #expect(e.mediaPanelSelectionAnchor == clips[0].id)
+    }
+
+    @Test func orderIncludesVisibleSectionsAndDeduplicatesAssets() {
+        let timelineKey = MediaPanelItemKey.timeline("tl-1")
+        let ids = MediaTab.searchOrderedItemIds(
+            momentAssetIds: ["moment", "shared"],
+            spokenAssetIds: ["spoken", "shared"],
+            timelineItemIds: [timelineKey],
+            fileAssetIds: ["file", "shared"],
+            collapsedSectionTitles: ["Spoken"]
+        )
+
+        #expect(ids == ["moment", "shared", timelineKey, "file"])
+    }
+
+    @Test func timelinesMatchingNameFiltersCaseInsensitively() {
+        let interview = Timeline(name: "Interview Cut")
+        let broll = Timeline(name: "B-Roll")
+        let coldOpen = Timeline(name: "Cold Open")
+
+        let matches = MediaTab.timelinesMatchingName(
+            [interview, broll, coldOpen],
+            query: " cut "
+        )
+
+        #expect(matches.map(\.id) == [interview.id])
+        #expect(MediaTab.timelinesMatchingName([interview, broll], query: "B-ROLL").map(\.id) == [broll.id])
+        #expect(MediaTab.timelinesMatchingName([interview], query: "   ").map(\.id) == [interview.id])
+        #expect(MediaTab.timelinesMatchingName([interview, broll], query: "missing").isEmpty)
+    }
+
+    @Test func creationSelectsAndRevealsFolderAndRestoresSelectionOnUndo() {
+        let e = editor()
+        let parentId = e.createFolder(name: "Parent")
+        let clip = asset(name: "clip")
+        e.importMediaAsset(clip)
+        e.selectMediaPanelItem(clip.id)
+        let undoManager = UndoManager()
+        e.undo.attach(undoManager)
+
+        let folderId = e.createMediaPanelFolder(in: parentId)
+
+        #expect(e.folder(id: folderId)?.parentFolderId == parentId)
+        #expect(e.selectedFolderIds == [folderId])
+        #expect(e.selectedMediaAssetIds.isEmpty)
+        #expect(e.mediaPanelScrollTarget == MediaPanelItemKey.folder(folderId))
+        #expect(e.undo.undoLatest() == "New Folder")
+        #expect(e.folder(id: folderId) == nil)
+        #expect(e.selectedMediaAssetIds == [clip.id])
+    }
+
+    @Test func mainMenuUsesStandardNewFolderShortcut() throws {
+        _ = NSApplication.shared
+        let mainMenu = MainMenuBuilder.buildMenu()
+        let fileMenu = try #require(mainMenu.items.compactMap(\.submenu).first { $0.title == "File" })
+        let item = try #require(fileMenu.items.first { $0.action == #selector(EditorActions.newMediaFolder(_:)) })
+
+        #expect(item.title == "New Folder")
+        #expect(item.keyEquivalent == "n")
+        #expect(item.keyEquivalentModifierMask == [.command, .shift])
+    }
+
+    @Test func mixedDeleteIsOneUndoableAction() {
+        let e = editor()
+        let folderId = e.createFolder(name: "Bin")
+        let selectedAssets = (0..<2).map { asset(name: "selected-\($0)") }
+        let keep = asset(name: "keep")
+        for clip in selectedAssets + [keep] { e.importMediaAsset(clip) }
+        let folderKey = MediaPanelItemKey.folder(folderId)
+        e.mediaPanelOrderedItemIds = [folderKey] + selectedAssets.map(\.id) + [keep.id]
+        e.selectMediaPanelItem(folderKey, mode: .replacing)
+        for clip in selectedAssets { e.selectMediaPanelItem(clip.id, mode: .toggling) }
+        let undoManager = UndoManager()
+        e.undo.attach(undoManager)
+
+        e.deleteMediaPanelItems(targeting: folderKey)
+
+        #expect(e.folder(id: folderId) == nil)
+        #expect(e.mediaAssets.map(\.id) == [keep.id])
+        #expect(e.undo.undoLatest() == "Delete Media Items")
+        #expect(e.folder(id: folderId) != nil)
+        #expect(Set(e.mediaAssets.map(\.id)) == Set(selectedAssets.map(\.id) + [keep.id]))
+        #expect(e.selectedFolderIds == [folderId])
+        #expect(e.selectedMediaAssetIds == Set(selectedAssets.map(\.id)))
+        #expect(e.mediaPanelSelectionAnchor == selectedAssets.last?.id)
+    }
+}
+
 // MARK: - handlePanelFinderDrop
 
 @Suite("MediaTab — handlePanelFinderDrop")
 @MainActor
 struct HandlePanelFinderDropTests {
 
-    @Test func addsAssetAtRootWhenDestinationIsNil() {
+    @Test func addsAssetAtRootWhenDestinationIsNil() async {
         let e = editor()
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
 
-        MediaTab.handlePanelFinderDrop(urls: [url], into: nil, editor: e)
+        await MediaTab.handlePanelFinderDrop(urls: [url], into: nil, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.folderId == nil)
     }
 
-    @Test func addsAssetAndMovesIntoDestinationFolder() {
+    @Test func addsAssetAndMovesIntoDestinationFolder() async {
         let e = editor()
         let dest = e.createFolder(name: "Dest")
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
 
-        MediaTab.handlePanelFinderDrop(urls: [url], into: dest, editor: e)
+        await MediaTab.handlePanelFinderDrop(urls: [url], into: dest, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.folderId == dest)
     }
 
-    @Test func skipsUnsupportedFileExtensions() {
+    @Test func skipsUnsupportedFileExtensions() async {
         let e = editor()
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-readme.txt")
 
-        MediaTab.handlePanelFinderDrop(urls: [url], into: nil, editor: e)
+        await MediaTab.handlePanelFinderDrop(urls: [url], into: nil, editor: e)
 
         #expect(e.mediaAssets.isEmpty)
     }
 
-    @Test func addsMultipleAssetsIntoDestination() {
+    @Test func addsMultipleAssetsIntoDestination() async {
         let e = editor()
         let dest = e.createFolder(name: "Dest")
         let urls = (0..<3).map { _ in
             URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
         }
 
-        MediaTab.handlePanelFinderDrop(urls: urls, into: dest, editor: e)
+        await MediaTab.handlePanelFinderDrop(urls: urls, into: dest, editor: e)
 
         #expect(e.mediaAssets.count == 3)
         #expect(e.mediaAssets.allSatisfy { $0.folderId == dest })
@@ -645,12 +823,12 @@ struct HandleClipboardPasteTests {
         return pb
     }
 
-    @Test func pngBytesImportAtRootWhenDestinationIsNil() {
+    @Test func pngBytesImportAtRootWhenDestinationIsNil() async {
         let e = editor()
         let pb = freshPasteboard()
         pb.setData(Data([0x89, 0x50, 0x4E, 0x47]), forType: .png)
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.type == .image)
@@ -658,49 +836,49 @@ struct HandleClipboardPasteTests {
         #expect(e.mediaAssets.first?.folderId == nil)
     }
 
-    @Test func pngBytesLandInDestinationFolder() {
+    @Test func pngBytesLandInDestinationFolder() async {
         let e = editor()
         let dest = e.createFolder(name: "Dest")
         let pb = freshPasteboard()
         pb.setData(Data([0x89, 0x50, 0x4E, 0x47]), forType: .png)
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: dest, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: dest, editor: e)
 
         #expect(e.mediaAssets.first?.folderId == dest)
         #expect(e.mediaManifest.entries.first?.folderId == dest)
     }
 
-    @Test func tiffBytesImportWithTiffExtension() {
+    @Test func tiffBytesImportWithTiffExtension() async {
         let e = editor()
         let pb = freshPasteboard()
         pb.setData(Data([0x4D, 0x4D, 0x00, 0x2A]), forType: .tiff)
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.url.pathExtension == "tiff")
     }
 
-    @Test func fileURLRoutesThroughFinderDrop() {
+    @Test func fileURLRoutesThroughFinderDrop() async {
         let e = editor()
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
         let pb = freshPasteboard()
         pb.writeObjects([url as NSURL])
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.type == .video)
     }
 
-    @Test func fileURLLandsInDestinationFolder() {
+    @Test func fileURLLandsInDestinationFolder() async {
         let e = editor()
         let dest = e.createFolder(name: "Dest")
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
         let pb = freshPasteboard()
         pb.writeObjects([url as NSURL])
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: dest, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: dest, editor: e)
 
         #expect(e.mediaAssets.first?.folderId == dest)
     }
@@ -709,45 +887,70 @@ struct HandleClipboardPasteTests {
     /// items always carry a TIFF preview alongside the file URL), the URL wins —
     /// avoids creating both the file-imported asset and a duplicate "pasted-*"
     /// image asset for the same payload.
-    @Test func fileURLTakesPrecedenceOverImageData() {
+    @Test func fileURLTakesPrecedenceOverImageData() async {
         let e = editor()
         let url = URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-clip.mp4")
         let pb = freshPasteboard()
         pb.setData(Data([0x89, 0x50, 0x4E, 0x47]), forType: .png)
         pb.writeObjects([url as NSURL])
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.count == 1)
         #expect(e.mediaAssets.first?.type == .video)
     }
 
-    @Test func emptyPasteboardIsNoOp() {
+    @Test func emptyPasteboardIsNoOp() async {
         let e = editor()
         let pb = freshPasteboard()
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.isEmpty)
     }
 
-    @Test func textOnlyPasteboardIsNoOp() {
+    @Test func textOnlyPasteboardIsNoOp() async {
         let e = editor()
         let pb = freshPasteboard()
         pb.setString("just some text", forType: .string)
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.isEmpty)
     }
 
-    @Test func fileURLWithUnsupportedExtensionIsNoOp() {
+    @Test func fileURLWithUnsupportedExtensionIsNoOp() async {
         let e = editor()
         let pb = freshPasteboard()
         pb.writeObjects([URL(fileURLWithPath: "/tmp/\(UUID().uuidString)-readme.txt") as NSURL])
 
-        MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
+        await MediaTab.handleClipboardPaste(pasteboard: pb, into: nil, editor: e)
 
         #expect(e.mediaAssets.isEmpty)
+    }
+}
+
+@Suite("EditorViewModel — media panel search")
+@MainActor
+struct MediaPanelSearchTests {
+
+    @Test func requestExpandsSearchAndCollapseClearsIt() {
+        let e = editor()
+        #expect(!e.isMediaPanelSearchExpanded)
+
+        e.requestMediaPanelSearch()
+        #expect(e.isMediaPanelSearchExpanded)
+        #expect(e.mediaPanelSearchFocusPending)
+
+        e.collapseMediaPanelSearch()
+        #expect(!e.isMediaPanelSearchExpanded)
+        #expect(!e.mediaPanelSearchFocusPending)
+    }
+
+    @Test func requestDoesNotStartMissingMediaRefresh() {
+        let e = editor()
+        #expect(e.missingMediaRefreshTask == nil)
+        e.requestMediaPanelSearch()
+        #expect(e.missingMediaRefreshTask == nil)
     }
 }

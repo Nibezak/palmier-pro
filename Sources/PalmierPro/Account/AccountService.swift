@@ -12,9 +12,9 @@ enum AccountTier: String, Decodable, Sendable {
 
     var planLabel: String {
         switch self {
-        case .none: return "Free"
-        case .pro: return "Pro plan"
-        case .max: return "Max plan"
+        case .none: return L10n.key("Free")
+        case .pro: return L10n.key("Pro plan")
+        case .max: return L10n.key("Max plan")
         }
     }
 
@@ -103,6 +103,7 @@ final class AccountService {
     private(set) var account: AccountResponse?
     private(set) var availablePlans: [AvailablePlan] = []
     private(set) var lastError: String?
+    private(set) var isSigningIn: Bool = false
     private(set) var isBuyingCredits: Bool = false
     private(set) var authState: AuthState<String> = .loading
 
@@ -142,12 +143,23 @@ final class AccountService {
         else {
             isMisconfigured = true
             isLoading = false
+            Log.account.warning(
+                "account backend misconfigured",
+                telemetry: "Account backend misconfigured",
+                data: [
+                    "hasClerkKey": BackendConfig.clerkPublishableKey != nil,
+                    "hasConvexURL": BackendConfig.convexDeploymentURL != nil
+                ]
+            )
             return
         }
 
+        let keychainConfig = BackendConfig.clerkKeychainAccessGroup
+            .map { Clerk.Options.KeychainConfig(accessGroup: $0) } ?? .init()
         Clerk.configure(
             publishableKey: publishableKey,
             options: Clerk.Options(
+                keychainConfig: keychainConfig,
                 redirectConfig: .init(
                     redirectUrl: "palmier://callback",
                     callbackUrlScheme: "palmier"
@@ -158,6 +170,7 @@ final class AccountService {
             deploymentUrl: deploymentURL.absoluteString,
             authProvider: ClerkConvexAuthProvider()
         )
+        Log.account.notice("account configured", telemetry: "Account configured")
         startPlansSubscription()
 
         startAuthObservation()
@@ -175,11 +188,14 @@ final class AccountService {
                 self.authState = state
                 switch state {
                 case .loading:
+                    Log.account.notice("auth state loading", telemetry: "Auth state changed", data: ["state": "loading"])
                     self.isLoading = true
                 case .authenticated:
+                    Log.account.notice("auth state authenticated", telemetry: "Auth state changed", data: ["state": "authenticated"])
                     await self.provisionAndSubscribe()
                     self.isLoading = false
                 case .unauthenticated:
+                    Log.account.notice("auth state unauthenticated", telemetry: "Auth state changed", data: ["state": "unauthenticated"])
                     self.clearAccount()
                     self.isLoading = Clerk.shared.session != nil
                 }
@@ -194,6 +210,12 @@ final class AccountService {
         let name = [user?.firstName, user?.lastName]
             .compactMap { $0 }
             .joined(separator: " ")
+        Telemetry.setUser(
+            id: user?.id,
+            email: user?.primaryEmailAddress?.emailAddress,
+            username: name.isEmpty ? nil : name
+        )
+        Analytics.identifyUser(id: user?.id)
         let args: [String: ConvexEncodable?] = [
             "email": user?.primaryEmailAddress?.emailAddress,
             "name": name.isEmpty ? nil : name,
@@ -202,11 +224,26 @@ final class AccountService {
 
         for attempt in 0..<3 {
             do {
+                if attempt == 0 {
+                    Log.account.notice("account provision start", telemetry: "Account provision started")
+                }
                 try await convex.mutation("users:upsertFromAuth", with: args)
+                Log.account.notice(
+                    "account provision ok attempt=\(attempt + 1)",
+                    telemetry: "Account provision finished",
+                    data: ["attempt": attempt + 1]
+                )
                 break
             } catch {
                 lastError = error.localizedDescription
-                if attempt == 2 { return }
+                if attempt == 2 {
+                    Log.account.warning(
+                        "account provision failed error=\(error.localizedDescription)",
+                        telemetry: "Account provision failed",
+                        data: ["attempt": attempt + 1, "error": error.localizedDescription]
+                    )
+                    return
+                }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
@@ -221,6 +258,11 @@ final class AccountService {
             .sink(
                 receiveCompletion: { [weak self] completion in
                     if case .failure(let err) = completion {
+                        Log.account.warning(
+                            "plans subscription failed error=\(err.localizedDescription)",
+                            telemetry: "Account plans subscription failed",
+                            data: ["error": err.localizedDescription]
+                        )
                         self?.lastError = err.localizedDescription
                     }
                 },
@@ -238,17 +280,28 @@ final class AccountService {
             .sink(
                 receiveCompletion: { [weak self] completion in
                     if case .failure(let err) = completion {
+                        Log.account.warning(
+                            "account subscription failed error=\(err.localizedDescription)",
+                            telemetry: "Account subscription failed",
+                            data: ["error": err.localizedDescription]
+                        )
                         self?.lastError = err.localizedDescription
                     }
                 },
                 receiveValue: { [weak self] response in
                     self?.account = response
                     self?.lastError = nil
+                    Analytics.identifyUser(
+                        id: Clerk.shared.user?.id,
+                        properties: ["tier": response.user.tier.rawValue]
+                    )
                 }
             )
     }
 
     private func clearAccount() {
+        Telemetry.setUser(id: nil)
+        Analytics.resetUser()
         accountSubscription?.cancel()
         accountSubscription = nil
         buyCreditsTask?.cancel()
@@ -259,20 +312,43 @@ final class AccountService {
 
     func signInWithGoogle() async {
         guard !isMisconfigured else { return }
+        guard !isSigningIn else {
+            lastError = "Sign-in is already in progress."
+            Log.account.notice(
+                "sign in ignored provider=google reason=in_progress",
+                telemetry: "Sign in ignored",
+                data: ["provider": "google", "reason": "in_progress"]
+            )
+            return
+        }
+        isSigningIn = true
         lastError = nil
+        Log.account.notice("sign in requested provider=google", telemetry: "Sign in requested", data: ["provider": "google"])
+        defer { isSigningIn = false }
         do {
             _ = try await Clerk.shared.auth.signInWithOAuth(provider: .google)
         } catch {
             lastError = error.localizedDescription
+            Log.account.warning(
+                "sign in failed provider=google error=\(error.localizedDescription)",
+                telemetry: "Sign in failed",
+                data: ["provider": "google", "error": error.localizedDescription]
+            )
         }
     }
 
     func signOut() async {
         guard !isMisconfigured else { return }
+        Log.account.notice("sign out requested", telemetry: "Sign out requested")
         do {
             try await Clerk.shared.auth.signOut()
         } catch {
             lastError = error.localizedDescription
+            Log.account.warning(
+                "sign out failed error=\(error.localizedDescription)",
+                telemetry: "Sign out failed",
+                data: ["error": error.localizedDescription]
+            )
         }
     }
 
@@ -364,7 +440,7 @@ final class AccountService {
             lastError = "Refused to open untrusted URL."
             return
         }
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.open(url, configuration: .init(), completionHandler: nil)
     }
 }
 
@@ -372,9 +448,9 @@ final class AccountService {
 
 extension AccountService {
     var displayPrimaryText: String {
-        if !isSignedIn { return "Signed out" }
+        if !isSignedIn { return L10n.string("Signed out") }
         let user = account?.user
-        return user?.displayName ?? user?.email ?? "Signed in"
+        return user?.displayName ?? user?.email ?? L10n.string("Signed in")
     }
 
     var displaySecondaryText: String? {
